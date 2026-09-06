@@ -22,3 +22,14 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+subprojects {
+    project.evaluationDependsOn(":app")
+    if (!project.state.executed) {
+        project.afterEvaluate {
+            (extensions.findByName("android") as? com.android.build.gradle.BaseExtension)?.compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_21
+                targetCompatibility = JavaVersion.VERSION_21
+            }
+        }
+    }
+}
