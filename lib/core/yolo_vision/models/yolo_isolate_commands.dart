@@ -44,6 +44,7 @@ class YoloFrameCommand extends YoloIsolateCommand {
   final double confThreshold;
   final double iouThreshold;
   final int rotationDegrees;
+  final String? cacheDirectoryPath;
   final SendPort replyPort;
 
   YoloFrameCommand({
@@ -60,6 +61,7 @@ class YoloFrameCommand extends YoloIsolateCommand {
     required this.confThreshold,
     required this.iouThreshold,
     this.rotationDegrees = 0,
+    this.cacheDirectoryPath,
     required this.replyPort,
   });
 }

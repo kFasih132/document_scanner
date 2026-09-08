@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'package:equatable/equatable.dart';
 import 'package:flutter/material.dart';
 
@@ -42,6 +43,59 @@ class CropQuadCorners extends Equatable {
     this.bottomRight = const Offset(0.92, 0.88),
     this.bottomLeft = const Offset(0.08, 0.88),
   });
+
+  /// Canonicalizes 4 arbitrary points into:
+  /// topLeft, topRight, bottomRight, bottomLeft.
+  factory CropQuadCorners.fromPoints(List<Offset> points) {
+    assert(points.length == 4);
+
+    final cx = (points[0].dx + points[1].dx + points[2].dx + points[3].dx) / 4.0;
+    final cy = (points[0].dy + points[1].dy + points[2].dy + points[3].dy) / 4.0;
+
+    const double baseAngle = -3.0 * math.pi / 4.0;
+    const double twoPi = 2.0 * math.pi;
+
+    final sorted = points.map((p) {
+      final dx = p.dx - cx;
+      final dy = p.dy - cy;
+      double angle = math.atan2(dy, dx) - baseAngle;
+      while (angle < 0.0) {
+        angle += twoPi;
+      }
+      while (angle >= twoPi) {
+        angle -= twoPi;
+      }
+      return (p, angle);
+    }).toList();
+
+    sorted.sort((a, b) => a.$2.compareTo(b.$2));
+
+    return CropQuadCorners(
+      topLeft: sorted[0].$1,
+      topRight: sorted[1].$1,
+      bottomRight: sorted[2].$1,
+      bottomLeft: sorted[3].$1,
+    );
+  }
+
+  /// Calculates the centroid (geometric center) of the 4 quadrilateral vertices
+  Offset get center => Offset(
+        (topLeft.dx + topRight.dx + bottomRight.dx + bottomLeft.dx) / 4.0,
+        (topLeft.dy + topRight.dy + bottomRight.dy + bottomLeft.dy) / 4.0,
+      );
+
+  /// Computes the area of the quadrilateral using the Shoelace formula
+  double get polygonArea {
+    final s1 = (topLeft.dx * topRight.dy) +
+        (topRight.dx * bottomRight.dy) +
+        (bottomRight.dx * bottomLeft.dy) +
+        (bottomLeft.dx * topLeft.dy);
+    final s2 = (topLeft.dy * topRight.dx) +
+        (topRight.dy * bottomRight.dx) +
+        (bottomRight.dy * bottomLeft.dx) +
+        (bottomLeft.dy * topLeft.dx);
+    return 0.5 * (s1 - s2).abs();
+  }
 
   CropQuadCorners copyWith({
     Offset? topLeft,
@@ -91,6 +145,7 @@ class CropQuadCorners extends Equatable {
 class ScannedPage extends Equatable {
   final String id;
   final String imagePath;
+  final String? originalImagePath;
   final int pageIndex;
   final DocumentFilter filter;
   final CropQuadCorners cropCorners;
@@ -99,6 +154,7 @@ class ScannedPage extends Equatable {
   const ScannedPage({
     required this.id,
     required this.imagePath,
+    this.originalImagePath,
     required this.pageIndex,
     this.filter = DocumentFilter.original,
     this.cropCorners = const CropQuadCorners(),
@@ -108,6 +164,7 @@ class ScannedPage extends Equatable {
   ScannedPage copyWith({
     String? id,
     String? imagePath,
+    String? originalImagePath,
     int? pageIndex,
     DocumentFilter? filter,
     CropQuadCorners? cropCorners,
@@ -116,6 +173,7 @@ class ScannedPage extends Equatable {
     return ScannedPage(
       id: id ?? this.id,
       imagePath: imagePath ?? this.imagePath,
+      originalImagePath: originalImagePath ?? this.originalImagePath,
       pageIndex: pageIndex ?? this.pageIndex,
       filter: filter ?? this.filter,
       cropCorners: cropCorners ?? this.cropCorners,
@@ -127,6 +185,7 @@ class ScannedPage extends Equatable {
     return {
       'id': id,
       'imagePath': imagePath,
+      'originalImagePath': originalImagePath,
       'pageIndex': pageIndex,
       'filter': filter.name,
       'cropCorners': cropCorners.toMap(),
@@ -138,20 +197,29 @@ class ScannedPage extends Equatable {
     return ScannedPage(
       id: map['id'] as String? ?? '',
       imagePath: map['imagePath'] as String? ?? '',
+      originalImagePath: map['originalImagePath'] as String?,
       pageIndex: map['pageIndex'] as int? ?? 0,
       filter: DocumentFilter.values.firstWhere(
         (f) => f.name == map['filter'],
         orElse: () => DocumentFilter.original,
       ),
       cropCorners: map['cropCorners'] != null
-          ? CropQuadCorners.fromMap(Map<String, dynamic>.from(map['cropCorners'] as Map))
+          ? CropQuadCorners.fromMap(map['cropCorners'] as Map<String, dynamic>)
           : const CropQuadCorners(),
       rotationDegrees: map['rotationDegrees'] as int? ?? 0,
     );
   }
 
   @override
-  List<Object?> get props => [id, imagePath, pageIndex, filter, cropCorners, rotationDegrees];
+  List<Object?> get props => [
+        id,
+        imagePath,
+        originalImagePath,
+        pageIndex,
+        filter,
+        cropCorners,
+        rotationDegrees,
+      ];
 }
 
 class ScannedDocument extends Equatable {
@@ -172,6 +240,14 @@ class ScannedDocument extends Equatable {
   });
 
   int get pageCount => pages.length;
+
+  /// Generates a unique, timestamped default document title
+  /// Format: Scan_D_M_YYYY_HHmmss (e.g. Scan_8_9_2026_120150)
+  static String generateDefaultTitle([DateTime? time]) {
+    final now = time ?? DateTime.now();
+    String pad(int n) => n.toString().padLeft(2, '0');
+    return 'Scan_${now.day}_${now.month}_${now.year}_${pad(now.hour)}${pad(now.minute)}${pad(now.second)}';
+  }
 
   ScannedDocument copyWith({
     String? id,

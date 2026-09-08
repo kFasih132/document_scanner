@@ -7,14 +7,18 @@ import '../../domain/models/scanned_document.dart';
 import '../bloc/scanner_bloc.dart';
 import '../bloc/scanner_event.dart';
 import '../bloc/scanner_state.dart';
-import '../widgets/filter_preset_selector.dart';
 import 'camera_scanner_screen.dart';
 import 'document_crop_screen.dart';
 
 class DocumentPreviewScreen extends StatefulWidget {
   final ScannedDocument? document;
+  final int? initialPageIndex;
 
-  const DocumentPreviewScreen({super.key, this.document});
+  const DocumentPreviewScreen({
+    super.key,
+    this.document,
+    this.initialPageIndex,
+  });
 
   @override
   State<DocumentPreviewScreen> createState() => _DocumentPreviewScreenState();
@@ -27,7 +31,18 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
   @override
   void initState() {
     super.initState();
-    _pageController = PageController();
+    final blocState = context.read<ScannerBloc>().state;
+    final totalPages = blocState.capturedPages.isNotEmpty
+        ? blocState.capturedPages.length
+        : (widget.document?.pages.length ?? 0);
+
+    final defaultIndex = widget.initialPageIndex ??
+        (totalPages > 0
+            ? blocState.selectedPageIndex.clamp(0, totalPages - 1)
+            : 0);
+
+    _currentPageIndex = defaultIndex;
+    _pageController = PageController(initialPage: _currentPageIndex);
   }
 
   @override
@@ -38,7 +53,7 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
 
   void _showSaveDialog(BuildContext context, int totalPages) {
     final String defaultTitle = widget.document?.title ??
-        'Scan_${DateTime.now().day}_${DateTime.now().month}_${DateTime.now().year}';
+        ScannedDocument.generateDefaultTitle();
     final titleController = TextEditingController(text: defaultTitle);
 
     showDialog(
@@ -61,7 +76,7 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
               ),
               const SizedBox(height: AppSpacing.md),
               Text(
-                'Includes $totalPages scanned pages with applied filters.',
+                'Includes $totalPages scanned pages.',
                 style: TextStyle(
                   fontSize: 12,
                   color: Theme.of(context).colorScheme.outline,
@@ -159,14 +174,24 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
                           activePage: activePage,
                           pageController: _pageController,
                           currentPageIndex: _currentPageIndex,
-                          onPageChanged: (index) => setState(() => _currentPageIndex = index),
+                          onPageChanged: (index) {
+                            setState(() => _currentPageIndex = index);
+                            context
+                                .read<ScannerBloc>()
+                                .add(SelectPageForEditingEvent(index));
+                          },
                         )
                       : MobilePreviewLayout(
                           pages: pages,
                           activePage: activePage,
                           pageController: _pageController,
                           currentPageIndex: _currentPageIndex,
-                          onPageChanged: (index) => setState(() => _currentPageIndex = index),
+                          onPageChanged: (index) {
+                            setState(() => _currentPageIndex = index);
+                            context
+                                .read<ScannerBloc>()
+                                .add(SelectPageForEditingEvent(index));
+                          },
                         ),
                 ),
               ],
@@ -193,7 +218,7 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
                 ),
               );
             },
-            onRotate: () => context.read<ScannerBloc>().add(const RotatePageEvent()),
+            onRotate: () => context.read<ScannerBloc>().add(RotatePageEvent(_currentPageIndex)),
             onDelete: () {
               context.read<ScannerBloc>().add(DeletePageEvent(_currentPageIndex));
               if (pages.length <= 1) {
@@ -202,6 +227,9 @@ class _DocumentPreviewScreenState extends State<DocumentPreviewScreen> {
                 setState(() {
                   if (_currentPageIndex > 0) _currentPageIndex--;
                 });
+                context
+                    .read<ScannerBloc>()
+                    .add(SelectPageForEditingEvent(_currentPageIndex));
               }
             },
           ),
@@ -282,29 +310,13 @@ class MobilePreviewLayout extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      children: [
-        // Page carousel
-        Expanded(
-          child: PageView.builder(
-            controller: pageController,
-            itemCount: pages.length,
-            onPageChanged: onPageChanged,
-            itemBuilder: (context, index) {
-              return SinglePageDisplay(page: pages[index]);
-            },
-          ),
-        ),
-
-        // Filter chips bar
-        FilterPresetSelector(
-          activeFilter: activePage.filter,
-          onFilterSelected: (filter) {
-            context.read<ScannerBloc>().add(ApplyFilterEvent(filter));
-          },
-        ),
-        const SizedBox(height: AppSpacing.xs),
-      ],
+    return PageView.builder(
+      controller: pageController,
+      itemCount: pages.length,
+      onPageChanged: onPageChanged,
+      itemBuilder: (context, index) {
+        return SinglePageDisplay(page: pages[index]);
+      },
     );
   }
 }
@@ -327,53 +339,18 @@ class TabletPreviewLayout extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      children: [
-        // Main page display
-        Expanded(
-          flex: 3,
-          child: PageView.builder(
-            controller: pageController,
-            itemCount: pages.length,
-            onPageChanged: onPageChanged,
-            itemBuilder: (context, index) {
-              return SinglePageDisplay(page: pages[index]);
-            },
-          ),
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 800),
+        child: PageView.builder(
+          controller: pageController,
+          itemCount: pages.length,
+          onPageChanged: onPageChanged,
+          itemBuilder: (context, index) {
+            return SinglePageDisplay(page: pages[index]);
+          },
         ),
-
-        // Tablet sidebar for filters & thumbnails
-        Expanded(
-          flex: 1,
-          child: Container(
-            color: Theme.of(context).colorScheme.surfaceContainerLow,
-            padding: const EdgeInsets.all(AppSpacing.md),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Filters & Enhancement',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                ),
-                const SizedBox(height: AppSpacing.sm),
-                ...DocumentFilter.values.map(
-                  (filter) => Padding(
-                    padding: const EdgeInsets.only(bottom: AppSpacing.xs),
-                    child: FilterChip(
-                      selected: filter == activePage.filter,
-                      label: Text(filter.label),
-                      avatar: Icon(filter.icon, size: 16),
-                      onSelected: (_) {
-                        context.read<ScannerBloc>().add(ApplyFilterEvent(filter));
-                      },
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
+      ),
     );
   }
 }
@@ -406,44 +383,13 @@ class SinglePageDisplay extends StatelessWidget {
           clipBehavior: Clip.antiAlias,
           child: RotatedBox(
             quarterTurns: (page.rotationDegrees ~/ 90),
-            child: ColorFiltered(
-              colorFilter: _getColorFilter(page.filter),
-              child: isLocal
-                  ? Image.file(File(page.imagePath), fit: BoxFit.contain)
-                  : const SimulatedDocumentContent(),
-            ),
+            child: isLocal
+                ? Image.file(File(page.imagePath), fit: BoxFit.contain)
+                : const SimulatedDocumentContent(),
           ),
         ),
       ),
     );
-  }
-
-  ColorFilter _getColorFilter(DocumentFilter filter) {
-    switch (filter) {
-      case DocumentFilter.original:
-        return const ColorFilter.mode(Colors.transparent, BlendMode.dst);
-      case DocumentFilter.grayscale:
-        return const ColorFilter.matrix(<double>[
-          0.2126, 0.7152, 0.0722, 0, 0,
-          0.2126, 0.7152, 0.0722, 0, 0,
-          0.2126, 0.7152, 0.0722, 0, 0,
-          0, 0, 0, 1, 0,
-        ]);
-      case DocumentFilter.blackAndWhite:
-        return const ColorFilter.matrix(<double>[
-          1.5, 1.5, 1.5, 0, -160,
-          1.5, 1.5, 1.5, 0, -160,
-          1.5, 1.5, 1.5, 0, -160,
-          0, 0, 0, 1, 0,
-        ]);
-      case DocumentFilter.magicColor:
-        return const ColorFilter.matrix(<double>[
-          1.2, 0, 0, 0, -10,
-          0, 1.2, 0, 0, -10,
-          0, 0, 1.2, 0, -10,
-          0, 0, 0, 1, 0,
-        ]);
-    }
   }
 }
 

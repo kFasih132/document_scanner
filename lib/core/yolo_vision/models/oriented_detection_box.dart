@@ -99,7 +99,7 @@ class OrientedDetectionBox {
     Point2D rotatePoint(Point2D p) {
       double nx = p.x;
       double ny = p.y;
-      
+
       int normalizedDegrees = ((degrees % 360) + 360) % 360;
       if (normalizedDegrees == 90) {
         nx = 1.0 - p.y;
@@ -124,7 +124,38 @@ class OrientedDetectionBox {
     );
   }
 
-  /// Factory helper that computes the envelope [x1, y1, x2, y2] automatically from the 4 points
+  /// Topologically sorts 4 points into canonical clockwise order:
+  /// [0] = Top-Left, [1] = Top-Right, [2] = Bottom-Right, [3] = Bottom-Left.
+  static List<Point2D> canonicalizePoints(List<Point2D> pts) {
+    if (pts.length != 4) return pts;
+
+    final cx = (pts[0].x + pts[1].x + pts[2].x + pts[3].x) / 4.0;
+    final cy = (pts[0].y + pts[1].y + pts[2].y + pts[3].y) / 4.0;
+
+    // Clockwise angle offset relative to Top-Left vector (-1, -1) which has angle -3*pi/4
+    const double baseAngle = -3.0 * math.pi / 4.0;
+    const double twoPi = 2.0 * math.pi;
+
+    final sortedWithAngle = pts.map((p) {
+      final dx = p.x - cx;
+      final dy = p.y - cy;
+      double angle = math.atan2(dy, dx) - baseAngle;
+      while (angle < 0.0) {
+        angle += twoPi;
+      }
+      while (angle >= twoPi) {
+        angle -= twoPi;
+      }
+      return (p, angle);
+    }).toList();
+
+    sortedWithAngle.sort((a, b) => a.$2.compareTo(b.$2));
+
+    return sortedWithAngle.map((item) => item.$1).toList(growable: false);
+  }
+
+  /// Factory helper that computes the envelope [x1, y1, x2, y2] automatically from the 4 points,
+  /// ensuring points are always canonically ordered [Top-Left, Top-Right, Bottom-Right, Bottom-Left].
   factory OrientedDetectionBox.fromPoints({
     required String label,
     required double confidence,
@@ -132,23 +163,25 @@ class OrientedDetectionBox {
     required List<Point2D> points,
   }) {
     assert(points.length == 4);
-    double minX = points[0].x;
-    double minY = points[0].y;
-    double maxX = points[0].x;
-    double maxY = points[0].y;
+    final canonical = canonicalizePoints(points);
+
+    double minX = canonical[0].x;
+    double minY = canonical[0].y;
+    double maxX = canonical[0].x;
+    double maxY = canonical[0].y;
 
     for (int i = 1; i < 4; i++) {
-      if (points[i].x < minX) minX = points[i].x;
-      if (points[i].y < minY) minY = points[i].y;
-      if (points[i].x > maxX) maxX = points[i].x;
-      if (points[i].y > maxY) maxY = points[i].y;
+      if (canonical[i].x < minX) minX = canonical[i].x;
+      if (canonical[i].y < minY) minY = canonical[i].y;
+      if (canonical[i].x > maxX) maxX = canonical[i].x;
+      if (canonical[i].y > maxY) maxY = canonical[i].y;
     }
 
     return OrientedDetectionBox(
       label: label,
       confidence: confidence,
       classIndex: classIndex,
-      points: points,
+      points: canonical,
       x1: minX,
       y1: minY,
       x2: maxX,

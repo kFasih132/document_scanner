@@ -38,12 +38,20 @@ class YoloDetectionResult {
   /// Inference time in milliseconds
   final int inferenceTimeMs;
 
+  /// Discrete Laplacian variance sharpness score of the input frame
+  final double sharpnessScore;
+
+  /// Absolute file path of the cached frame on which detection was performed
+  final String? cachedImagePath;
+
   const YoloDetectionResult({
     this.boxes = const [],
     this.orientedBoxes = const [],
     this.crops = const [],
     this.annotatedImageBytes,
     this.inferenceTimeMs = 0,
+    this.sharpnessScore = 0.0,
+    this.cachedImagePath,
   });
 
   bool get isEmpty => boxes.isEmpty && orientedBoxes.isEmpty;

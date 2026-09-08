@@ -509,7 +509,7 @@ class YoloVisionService {
     return candidates;
   }
 
-  /// NMS for standard 2D boxes
+  /// NMS for standard 2D boxes with Overlap-over-Min-Area suppression
   static List<DetectionBox> applyNms(
     List<DetectionBox> boxes, {
     required double iouThreshold,
@@ -523,7 +523,9 @@ class YoloVisionService {
     for (final box in boxes) {
       bool keep = true;
       for (final s in selected) {
-        if (box.calculateIou(s) > iouThreshold) {
+        final iou = box.calculateIou(s);
+        final overlap = box.calculateOverlapCoefficient(s);
+        if (iou > iouThreshold || overlap > 0.35) {
           keep = false;
           break;
         }
@@ -533,7 +535,7 @@ class YoloVisionService {
     return selected;
   }
 
-  /// NMS for 4-point diagonal boxes based on envelope IoU
+  /// NMS for 4-point diagonal boxes based on envelope IoU and overlap coefficient
   static List<OrientedDetectionBox> applyOrientedNms(
     List<OrientedDetectionBox> boxes, {
     required double iouThreshold,
@@ -567,7 +569,9 @@ class YoloVisionService {
           y2: s.y2,
         );
 
-        if (boxEnvelope.calculateIou(sEnvelope) > iouThreshold) {
+        final iou = boxEnvelope.calculateIou(sEnvelope);
+        final overlap = boxEnvelope.calculateOverlapCoefficient(sEnvelope);
+        if (iou > iouThreshold || overlap > 0.35) {
           keep = false;
           break;
         }

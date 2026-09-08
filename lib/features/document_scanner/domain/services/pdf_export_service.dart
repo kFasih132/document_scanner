@@ -5,10 +5,15 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:share_plus/share_plus.dart';
 import '../models/scanned_document.dart';
+import 'document_post_processing_service.dart';
 
 /// Production-ready service for generating and sharing PDF files from scanned documents.
 class PdfExportService {
   static const String _pdfFolderName = 'doc_scanner_storage/pdfs';
+  final DocumentPostProcessingService _postProcessingService;
+
+  PdfExportService({DocumentPostProcessingService? postProcessingService})
+      : _postProcessingService = postProcessingService ?? DocumentPostProcessingService();
 
   Future<Directory> _getPdfDirectory() async {
     final appDir = await getApplicationDocumentsDirectory();
@@ -31,7 +36,20 @@ class PdfExportService {
 
       for (int i = 0; i < document.pages.length; i++) {
         final page = document.pages[i];
-        final imageFile = File(page.imagePath);
+        String resolvedImagePath = page.imagePath;
+
+        // Apply physical filter if selected
+        if (page.filter != DocumentFilter.original) {
+          final filteredPath = await _postProcessingService.applyFilter(
+            sourceImagePath: page.imagePath,
+            filter: page.filter,
+          );
+          if (filteredPath != null) {
+            resolvedImagePath = filteredPath;
+          }
+        }
+
+        final imageFile = File(resolvedImagePath);
 
         if (await imageFile.exists()) {
           final Uint8List imageBytes = await imageFile.readAsBytes();

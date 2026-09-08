@@ -10,6 +10,7 @@ import '../bloc/scanner_state.dart';
 import '../widgets/document_options_sheet.dart';
 import 'camera_scanner_screen.dart';
 import 'document_preview_screen.dart';
+import 'scanner_settings_screen.dart';
 
 class ScannerHomeScreen extends StatefulWidget {
   const ScannerHomeScreen({super.key});
@@ -60,6 +61,10 @@ class _ScannerHomeScreenState extends State<ScannerHomeScreen> {
       child: Scaffold(
         appBar: const ScannerHomeAppBar(),
         body: BlocBuilder<ScannerBloc, ScannerState>(
+          buildWhen: (previous, current) {
+            return previous.recentDocuments != current.recentDocuments ||
+                previous.status != current.status;
+          },
           builder: (context, state) {
             return ResponsiveLayout(
               mobile: ScannerHomeBody(
@@ -124,9 +129,16 @@ class ScannerHomeAppBar extends StatelessWidget implements PreferredSizeWidget {
           },
         ),
         IconButton(
-          icon: const Icon(Icons.more_vert_rounded),
-          tooltip: 'Settings & Storage',
-          onPressed: () {},
+          icon: const Icon(Icons.tune_rounded),
+          tooltip: 'Scanner & AI Settings',
+          onPressed: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => const ScannerSettingsScreen(),
+              ),
+            );
+          },
         ),
         const SizedBox(width: AppSpacing.xs),
       ],

@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_spacing.dart';
+import '../bloc/scanner_state.dart';
+import 'model_selector_toggle.dart';
 
 class CameraControlsHeader extends StatelessWidget {
   final bool isFlashOn;
   final bool isAutoCapture;
+  final ScannerModelOption activeModel;
+  final ValueChanged<ScannerModelOption> onSelectModel;
+  final bool isModelLoading;
   final VoidCallback onClose;
   final VoidCallback onToggleFlash;
   final VoidCallback onToggleAutoCapture;
@@ -13,6 +18,9 @@ class CameraControlsHeader extends StatelessWidget {
     super.key,
     required this.isFlashOn,
     required this.isAutoCapture,
+    required this.activeModel,
+    required this.onSelectModel,
+    this.isModelLoading = false,
     required this.onClose,
     required this.onToggleFlash,
     required this.onToggleAutoCapture,
@@ -22,8 +30,8 @@ class CameraControlsHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.symmetric(
-        horizontal: AppSpacing.lg,
-        vertical: AppSpacing.md,
+        horizontal: AppSpacing.md,
+        vertical: AppSpacing.sm,
       ),
       decoration: const BoxDecoration(
         gradient: LinearGradient(
@@ -47,7 +55,19 @@ class CameraControlsHeader extends StatelessWidget {
               onPressed: onClose,
             ),
 
-            // Middle Action Group
+            // Model Switcher Pill Toggle
+            Flexible(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: AppSpacing.xs),
+                child: ModelSelectorToggle(
+                  selectedModel: activeModel,
+                  onModelSelected: onSelectModel,
+                  isLoading: isModelLoading,
+                ),
+              ),
+            ),
+
+            // Camera Action Group
             Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -58,7 +78,7 @@ class CameraControlsHeader extends StatelessWidget {
                   isActive: isFlashOn,
                   onPressed: onToggleFlash,
                 ),
-                const SizedBox(width: AppSpacing.sm),
+                const SizedBox(width: AppSpacing.xs),
 
                 // Auto Capture Toggle
                 AutoCaptureToggleChip(
@@ -66,12 +86,6 @@ class CameraControlsHeader extends StatelessWidget {
                   onTap: onToggleAutoCapture,
                 ),
               ],
-            ),
-
-            // Settings/Help Button
-            const HeaderIconButton(
-              icon: Icons.grid_on_rounded,
-              tooltip: 'Grid lines',
             ),
           ],
         ),
@@ -138,15 +152,15 @@ class AutoCaptureToggleChip extends StatelessWidget {
         onTap: onTap,
         child: Padding(
           padding: const EdgeInsets.symmetric(
-            horizontal: AppSpacing.md,
-            vertical: AppSpacing.xs + 2,
+            horizontal: AppSpacing.sm,
+            vertical: AppSpacing.xs + 1,
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
                 isAuto ? Icons.auto_mode_rounded : Icons.touch_app_rounded,
-                size: 16,
+                size: 15,
                 color: isAuto ? Colors.black : Colors.white,
               ),
               const SizedBox(width: AppSpacing.xs),
@@ -155,8 +169,8 @@ class AutoCaptureToggleChip extends StatelessWidget {
                 style: TextStyle(
                   color: isAuto ? Colors.black : Colors.white,
                   fontWeight: FontWeight.bold,
-                  fontSize: 11,
-                  letterSpacing: 0.5,
+                  fontSize: 10.5,
+                  letterSpacing: 0.3,
                 ),
               ),
             ],

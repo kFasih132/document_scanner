@@ -147,8 +147,8 @@ class DocumentOptionsSheet extends StatelessWidget {
               subtitle: const Text('Permanently remove all scanned pages'),
               shape: const RoundedRectangleBorder(borderRadius: AppSpacing.roundedMd),
               onTap: () {
-                Navigator.pop(context);
-                _confirmDelete(context);
+                final bloc = context.read<ScannerBloc>();
+                _confirmDelete(context, bloc);
               },
             ),
             const SizedBox(height: AppSpacing.xs),
@@ -158,9 +158,9 @@ class DocumentOptionsSheet extends StatelessWidget {
     );
   }
 
-  void _confirmDelete(BuildContext context) {
+  void _confirmDelete(BuildContext sheetContext, ScannerBloc bloc) {
     showDialog(
-      context: context,
+      context: sheetContext,
       builder: (dialogContext) {
         return AlertDialog(
           title: const Text('Delete Document?'),
@@ -172,11 +172,12 @@ class DocumentOptionsSheet extends StatelessWidget {
             ),
             FilledButton(
               style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.error,
+                backgroundColor: Theme.of(dialogContext).colorScheme.error,
               ),
               onPressed: () {
+                bloc.add(DeleteDocumentEvent(document.id));
                 Navigator.pop(dialogContext);
-                context.read<ScannerBloc>().add(DeleteDocumentEvent(document.id));
+                Navigator.pop(sheetContext);
               },
               child: const Text('Delete'),
             ),

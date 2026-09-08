@@ -1,16 +1,21 @@
 import 'dart:async';
 import 'dart:developer' as dev;
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../../../../core/yolo_vision/models/yolo_model_config.dart';
 import '../../../../core/yolo_vision/models/yolo_model_type.dart';
+import '../../../../core/yolo_vision/services/auto_capture_decision_engine.dart';
+import '../../../../core/yolo_vision/services/temporal_corner_smoother.dart';
 import '../../../../core/yolo_vision/services/yolo_isolate_worker.dart';
 import '../../domain/models/scanned_document.dart';
+import '../../domain/services/document_post_processing_service.dart';
 import '../../domain/services/image_crop_service.dart';
 import '../../domain/services/local_document_storage_service.dart';
 import '../../domain/services/pdf_export_service.dart';
@@ -21,27 +26,48 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
   final LocalDocumentStorageService _storageService;
   final PdfExportService _pdfExportService;
   final ImageCropService _cropService;
+  final DocumentPostProcessingService _postProcessingService;
 
   final YoloIsolateWorker _yoloWorker = YoloIsolateWorker();
+  final TemporalCornerSmoother _cornerSmoother = TemporalCornerSmoother();
+  final AutoCaptureDecisionEngine _autoCaptureEngine =
+      AutoCaptureDecisionEngine();
+
   bool _isWorkerInitialized = false;
   bool _isModelLoaded = false;
   bool _isDisposingCamera = false;
   bool _isInitializingCamera = false;
   bool _isProcessingFrame = false;
+  bool _isCameraActive = false;
+  int _cameraSessionId = 0;
   int _missedDetectionCount = 0;
-  DateTime _lastFrameTime = DateTime.fromMillisecondsSinceEpoch(0);
+  double _lastSharpnessScore = 0.0;
+  bool _isCurrentInstanceCaptured = false;
+  List<CropQuadCorners> _lastCapturedCornersList = [];
+  String? _cacheDirectoryPath;
+  String? _lastCachedFramePath;
+  CropQuadCorners? _lastCachedCorners;
+  List<CropQuadCorners> _lastCachedCornersList = [];
 
   CameraController? _cameraController;
   List<CameraDescription> _availableCameras = [];
 
   CameraController? get cameraController => _cameraController;
+  bool get isCameraActive => _isCameraActive;
+  DocumentPostProcessingService get postProcessingService =>
+      _postProcessingService;
 
   ScannerBloc({
     LocalDocumentStorageService? storageService,
     PdfExportService? pdfExportService,
     ImageCropService? cropService,
+    DocumentPostProcessingService? postProcessingService,
   }) : _storageService = storageService ?? LocalDocumentStorageService(),
-       _pdfExportService = pdfExportService ?? PdfExportService(),
+       _postProcessingService =
+           postProcessingService ?? DocumentPostProcessingService(),
+       _pdfExportService =
+           pdfExportService ??
+           PdfExportService(postProcessingService: postProcessingService),
        _cropService = cropService ?? ImageCropService(),
        super(const ScannerState()) {
     on<LoadSavedDocumentsEvent>(_onLoadSavedDocuments);
@@ -65,6 +91,9 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
     on<ResetScannerEvent>(_onResetScanner);
     on<LiveCornersDetectedEvent>(_onLiveCornersDetected);
     on<ClearLiveCornersEvent>(_onClearLiveCorners);
+    on<SwitchScannerModelEvent>(_onSwitchScannerModel);
+    on<UpdateScannerConfigEvent>(_onUpdateScannerConfig);
+    on<ResetScannerConfigEvent>(_onResetScannerConfig);
   }
 
   Future<void> _onInitializeCamera(
@@ -79,8 +108,23 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
       await Future.delayed(const Duration(milliseconds: 50));
     }
 
+    _cameraSessionId++;
+    final int sessionToken = _cameraSessionId;
+    _isCameraActive = true;
+    _isProcessingFrame = false;
+
+    // Reset instance-based capture lockout
+    _isCurrentInstanceCaptured = false;
+    _lastCapturedCornersList = [];
+
     // If camera controller is already initialized and valid, reuse it smoothly
     if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try {
+        final appDir = await getApplicationDocumentsDirectory();
+        _cacheDirectoryPath = '${appDir.path}/doc_scanner_storage/cache';
+        final dir = Directory(_cacheDirectoryPath!);
+        if (!dir.existsSync()) dir.createSync(recursive: true);
+      } catch (_) {}
       emit(
         state.copyWith(
           status: ScannerStatus.cameraReady,
@@ -138,9 +182,26 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
         _cameraController = newController;
         await newController.initialize();
 
+        // Check if camera was disposed while awaiting initialization
+        if (!_isCameraActive || _cameraSessionId != sessionToken) {
+          try {
+            await newController.dispose();
+          } catch (_) {}
+          _cameraController = null;
+          return;
+        }
+
         // Ensure flash is off upon clean init
         try {
           await newController.setFlashMode(FlashMode.off);
+        } catch (_) {}
+
+        // Ensure cache directory exists for live frame caching
+        try {
+          final appDir = await getApplicationDocumentsDirectory();
+          _cacheDirectoryPath = '${appDir.path}/doc_scanner_storage/cache';
+          final dir = Directory(_cacheDirectoryPath!);
+          if (!dir.existsSync()) dir.createSync(recursive: true);
         } catch (_) {}
 
         emit(
@@ -152,7 +213,7 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
           ),
         );
 
-        // Initialize YOLO isolate worker and load notes-v1.tflite
+        // Initialize YOLO isolate worker and load model
         await _initYoloModel(emit);
 
         // Start real-time image stream for auto-detection
@@ -182,148 +243,485 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
     }
   }
 
-  Future<void> _initYoloModel(Emitter<ScannerState> emit) async {
-    if (_isModelLoaded) return;
+  Future<bool> _loadYoloModelInIsolate({
+    required ScannerModelOption modelOption,
+    required YoloHardwareDelegate delegate,
+    required Emitter<ScannerState> emit,
+  }) async {
+    _isModelLoaded = false;
     try {
       if (!_isWorkerInitialized) {
         _isWorkerInitialized = await _yoloWorker.initialize();
       }
-      if (!_isWorkerInitialized) return;
+      if (!_isWorkerInitialized) return false;
 
-      const config = YoloModelConfig(
-        modelId: 'notes_v1_pose',
-        assetPath: 'assets/models/notes-v1.tflite',
-        labels: ['document'],
+      final config = YoloModelConfig(
+        modelId: modelOption.id,
+        assetPath: modelOption.assetPath,
+        labels: const ['document'],
         modelType: YoloModelType.pose4Points,
+        delegate: delegate,
         inputWidth: 768,
         inputHeight: 768,
-        isNmsFree: true,
-        defaultConfThreshold: 0.25,
-        defaultIouThreshold: 0.45,
-        numKeypoints: 4,
-        keypointDim: 3,
+        isNmsFree: false,
       );
 
       final loaded = await _yoloWorker.loadModel(config);
       if (loaded) {
         _isModelLoaded = true;
-        emit(state.copyWith(isModelLoaded: true));
-        debugPrint(
-          '[ScannerBloc] notes-v1.tflite loaded successfully in isolate',
+        emit(
+          state.copyWith(
+            activeModel: modelOption,
+            hardwareDelegate: delegate,
+            isModelLoaded: true,
+            statusMessage:
+                '${modelOption.title} (${delegate.name.toUpperCase()}) loaded',
+          ),
         );
+        debugPrint(
+          '[ScannerBloc] ${modelOption.title} (${modelOption.assetPath}) with ${delegate.name} loaded successfully in isolate',
+        );
+        return true;
+      } else {
+        emit(
+          state.copyWith(statusMessage: 'Failed to load ${modelOption.title}'),
+        );
+        return false;
       }
     } catch (e) {
-      debugPrint('[ScannerBloc] _initYoloModel error: $e');
+      debugPrint('[ScannerBloc] _loadYoloModelInIsolate error: $e');
+      emit(state.copyWith(statusMessage: 'Error loading ${modelOption.title}'));
+      return false;
+    }
+  }
+
+  Future<void> _initYoloModel(Emitter<ScannerState> emit) async {
+    if (_isModelLoaded) return;
+    await _loadYoloModelInIsolate(
+      modelOption: state.activeModel,
+      delegate: state.hardwareDelegate,
+      emit: emit,
+    );
+  }
+
+  Future<void> _onSwitchScannerModel(
+    SwitchScannerModelEvent event,
+    Emitter<ScannerState> emit,
+  ) async {
+    if (state.activeModel == event.model && _isModelLoaded) return;
+
+    emit(
+      state.copyWith(
+        activeModel: event.model,
+        isModelLoaded: false,
+        statusMessage: 'Loading ${event.model.title}...',
+      ),
+    );
+
+    await _loadYoloModelInIsolate(
+      modelOption: event.model,
+      delegate: state.hardwareDelegate,
+      emit: emit,
+    );
+  }
+
+  Future<void> _onUpdateScannerConfig(
+    UpdateScannerConfigEvent event,
+    Emitter<ScannerState> emit,
+  ) async {
+    final newConf = event.confThreshold ?? state.confThreshold;
+    final newIou = event.iouThreshold ?? state.iouThreshold;
+    final newDelegate = event.hardwareDelegate ?? state.hardwareDelegate;
+    final newModel = event.model ?? state.activeModel;
+
+    final delegateChanged = newDelegate != state.hardwareDelegate;
+    final modelChanged = newModel != state.activeModel;
+
+    emit(
+      state.copyWith(
+        confThreshold: newConf,
+        iouThreshold: newIou,
+        hardwareDelegate: newDelegate,
+        activeModel: newModel,
+      ),
+    );
+
+    if (delegateChanged || modelChanged) {
+      emit(
+        state.copyWith(
+          isModelLoaded: false,
+          statusMessage: 'Applying settings & reloading model...',
+        ),
+      );
+      await _loadYoloModelInIsolate(
+        modelOption: newModel,
+        delegate: newDelegate,
+        emit: emit,
+      );
+    }
+  }
+
+  Future<void> _onResetScannerConfig(
+    ResetScannerConfigEvent event,
+    Emitter<ScannerState> emit,
+  ) async {
+    const defaultConf = 0.25;
+    const defaultIou = 0.45;
+    const defaultDelegate = YoloHardwareDelegate.cpu;
+    const defaultModel = ScannerModelOption.v1Fp32;
+
+    final delegateChanged = state.hardwareDelegate != defaultDelegate;
+    final modelChanged = state.activeModel != defaultModel;
+
+    emit(
+      state.copyWith(
+        confThreshold: defaultConf,
+        iouThreshold: defaultIou,
+        hardwareDelegate: defaultDelegate,
+        activeModel: defaultModel,
+      ),
+    );
+
+    if (delegateChanged || modelChanged) {
+      emit(
+        state.copyWith(
+          isModelLoaded: false,
+          statusMessage: 'Resetting model to V1 FP32 CPU...',
+        ),
+      );
+      await _loadYoloModelInIsolate(
+        modelOption: defaultModel,
+        delegate: defaultDelegate,
+        emit: emit,
+      );
     }
   }
 
   Future<void> _startImageStreamIfNeeded() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+    if (_cameraController == null ||
+        !_cameraController!.value.isInitialized ||
+        !_isCameraActive ||
+        _isDisposingCamera) {
       return;
     }
     if (_cameraController!.value.isStreamingImages) {
       return;
     }
 
+    final int sessionToken = _cameraSessionId;
+
     try {
       await _cameraController!.startImageStream((CameraImage image) {
-        final now = DateTime.now();
-        if (_isProcessingFrame ||
-            now.difference(_lastFrameTime).inMilliseconds < 90) {
+        if (!_isCameraActive ||
+            _isDisposingCamera ||
+            _cameraSessionId != sessionToken ||
+            _cameraController == null ||
+            !_cameraController!.value.isInitialized) {
           return;
         }
-        _isProcessingFrame = true;
-        _lastFrameTime = now;
 
-        final rotationDegrees = _cameraController?.description.sensorOrientation ?? 90;
-        _processCameraImage(image, rotationDegrees)
-            .then((_) {
-              _isProcessingFrame = false;
-            })
-            .catchError((e) {
-              _isProcessingFrame = false;
-            });
+        // Run ML whenever worker isolate is ready (continuous ~15-20 FPS)
+        if (_isProcessingFrame ||
+            !_isModelLoaded ||
+            !_isCameraActive ||
+            _cameraSessionId != sessionToken) {
+          return;
+        }
+
+        final rotationDegrees =
+            _cameraController?.description.sensorOrientation ?? 90;
+
+        final isYuv =
+            image.format.group == ImageFormatGroup.yuv420 ||
+            image.format.group == ImageFormatGroup.nv21;
+        final yPlane = image.planes[0].bytes;
+        final width = image.width;
+        final height = image.height;
+        final yRowStride = image.planes[0].bytesPerRow;
+
+        final uPlane = image.planes.length > 1 ? image.planes[1].bytes : null;
+        final vPlane = image.planes.length > 2 ? image.planes[2].bytes : null;
+        final bgra = !isYuv && image.planes.isNotEmpty
+            ? image.planes[0].bytes
+            : null;
+        final uvRowStride = image.planes.length > 1
+            ? image.planes[1].bytesPerRow
+            : 0;
+        final uvPixelStride = image.planes.length > 1
+            ? (image.planes[1].bytesPerPixel ?? 1)
+            : 1;
+
+        _isProcessingFrame = true;
+
+        _runPeriodicMlInference(
+          sessionToken: sessionToken,
+          yPlane: yPlane,
+          uPlane: uPlane,
+          vPlane: vPlane,
+          bgra: bgra,
+          width: width,
+          height: height,
+          yRowStride: yRowStride,
+          uvRowStride: uvRowStride,
+          uvPixelStride: uvPixelStride,
+          isYuv: isYuv,
+          rotationDegrees: rotationDegrees,
+        ).whenComplete(() {
+          _isProcessingFrame = false;
+        });
       });
     } catch (e) {
       debugPrint('[ScannerBloc] startImageStream error: $e');
     }
   }
 
-  Future<void> _processCameraImage(CameraImage image, int rotationDegrees) async {
+  Future<void> _runPeriodicMlInference({
+    required int sessionToken,
+    required Uint8List yPlane,
+    Uint8List? uPlane,
+    Uint8List? vPlane,
+    Uint8List? bgra,
+    required int width,
+    required int height,
+    required int yRowStride,
+    required int uvRowStride,
+    required int uvPixelStride,
+    required bool isYuv,
+    required int rotationDegrees,
+  }) async {
     if (!_isModelLoaded ||
+        !_isCameraActive ||
+        _cameraSessionId != sessionToken ||
         _cameraController == null ||
         !_cameraController!.value.isInitialized) {
       return;
     }
 
     try {
-      final isYuv =
-          image.format.group == ImageFormatGroup.yuv420 ||
-          image.format.group == ImageFormatGroup.nv21;
-      final yPlane = image.planes[0].bytes;
-      final uPlane = image.planes.length > 1 ? image.planes[1].bytes : null;
-      final vPlane = image.planes.length > 2 ? image.planes[2].bytes : null;
-      final bgra = !isYuv && image.planes.isNotEmpty
-          ? image.planes[0].bytes
-          : null;
-
       final result = await _yoloWorker.processFrame(
         yPlaneBytes: yPlane,
         uPlaneBytes: uPlane,
         vPlaneBytes: vPlane,
         bgraBytes: bgra,
-        width: image.width,
-        height: image.height,
-        yRowStride: image.planes[0].bytesPerRow,
-        uvRowStride: image.planes.length > 1 ? image.planes[1].bytesPerRow : 0,
-        uvPixelStride: image.planes.length > 1
-            ? (image.planes[1].bytesPerPixel ?? 1)
-            : 1,
+        width: width,
+        height: height,
+        yRowStride: yRowStride,
+        uvRowStride: uvRowStride,
+        uvPixelStride: uvPixelStride,
         isYuv: isYuv,
-        confThreshold: 0.25,
-        iouThreshold: 0.45,
+        confThreshold: state.confThreshold,
+        iouThreshold: state.iouThreshold,
         rotationDegrees: rotationDegrees,
+        cacheDirectoryPath: _cacheDirectoryPath,
       );
 
+      // Verify camera and session are still active after async isolate execution
+      if (!_isCameraActive ||
+          _cameraSessionId != sessionToken ||
+          _cameraController == null) {
+        return;
+      }
+
+      if (result != null) {
+        _lastSharpnessScore = result.sharpnessScore;
+        if (result.cachedImagePath != null) {
+          _lastCachedFramePath = result.cachedImagePath;
+        }
+      }
+
+      final List<CropQuadCorners> rawCornersList = [];
       if (result != null && result.orientedBoxes.isNotEmpty) {
+        for (final ob in result.orientedBoxes) {
+          rawCornersList.add(
+            CropQuadCorners.fromPoints([
+              Offset(ob.p1.x, ob.p1.y),
+              Offset(ob.p2.x, ob.p2.y),
+              Offset(ob.p3.x, ob.p3.y),
+              Offset(ob.p4.x, ob.p4.y),
+            ]),
+          );
+        }
+      } else if (result != null && result.boxes.isNotEmpty) {
+        for (final b in result.boxes) {
+          rawCornersList.add(
+            CropQuadCorners(
+              topLeft: Offset(b.x1, b.y1),
+              topRight: Offset(b.x2, b.y1),
+              bottomRight: Offset(b.x2, b.y2),
+              bottomLeft: Offset(b.x1, b.y2),
+            ),
+          );
+        }
+      }
+
+      // Suppress duplicate/overlapping predictions for the same document
+      final List<CropQuadCorners> deduplicatedCornersList = [];
+      for (final candidate in rawCornersList) {
+        bool isDuplicate = false;
+        for (final existing in deduplicatedCornersList) {
+          final dist = (candidate.center - existing.center).distance;
+          if (dist < 0.18) {
+            isDuplicate = true;
+            break;
+          }
+        }
+        if (!isDuplicate) {
+          deduplicatedCornersList.add(candidate);
+        }
+      }
+
+      _lastCachedCornersList = deduplicatedCornersList;
+      _lastCachedCorners =
+          deduplicatedCornersList.isNotEmpty ? deduplicatedCornersList.first : null;
+
+      if (!_isCameraActive || _cameraSessionId != sessionToken) {
+        return;
+      }
+
+      if (deduplicatedCornersList.isNotEmpty) {
         _missedDetectionCount = 0;
-        final ob = result.orientedBoxes.first;
-        dev.log(
-          '✨ [ScannerBloc] 📄 Quad Corners: conf=${ob.confidence.toStringAsFixed(3)} '
-          'p1=(${ob.p1.x.toStringAsFixed(2)}, ${ob.p1.y.toStringAsFixed(2)}) '
-          'p2=(${ob.p2.x.toStringAsFixed(2)}, ${ob.p2.y.toStringAsFixed(2)}) '
-          'p3=(${ob.p3.x.toStringAsFixed(2)}, ${ob.p3.y.toStringAsFixed(2)}) '
-          'p4=(${ob.p4.x.toStringAsFixed(2)}, ${ob.p4.y.toStringAsFixed(2)})',
-          name: 'YOLO',
-        );
-        final detectedCorners = CropQuadCorners(
-          topLeft: Offset(ob.p1.x, ob.p1.y),
-          topRight: Offset(ob.p2.x, ob.p2.y),
-          bottomRight: Offset(ob.p3.x, ob.p3.y),
-          bottomLeft: Offset(ob.p4.x, ob.p4.y),
-        );
-        add(LiveCornersDetectedEvent(detectedCorners));
+
+        // Instance lockout check: has the document moved or was a new page placed?
+        if (_isCurrentInstanceCaptured && _lastCapturedCornersList.isNotEmpty) {
+          bool moved = false;
+          if (_lastCapturedCornersList.length != deduplicatedCornersList.length) {
+            moved = true;
+          } else {
+            for (int i = 0; i < deduplicatedCornersList.length; i++) {
+              final shift = _computeMaxCornerDelta(
+                _lastCapturedCornersList[i],
+                deduplicatedCornersList[i],
+              );
+              if (shift > 0.28) {
+                moved = true;
+                break;
+              }
+            }
+          }
+
+          if (moved) {
+            _isCurrentInstanceCaptured = false;
+            _lastCapturedCornersList = [];
+          } else {
+            final smoothedList =
+                _cornerSmoother.processMultiple(deduplicatedCornersList);
+            final displayList =
+                smoothedList.isNotEmpty ? smoothedList : deduplicatedCornersList;
+            final count = displayList.length;
+            add(
+              LiveCornersDetectedEvent(
+                corners: displayList.first,
+                cornersList: displayList,
+                isDocumentLocked: true,
+                autoCaptureProgress: 1.0,
+                sharpnessScore: _lastSharpnessScore,
+                statusMessage: count > 1
+                    ? '$count pages already captured • Move to next page'
+                    : 'Page already captured • Move to next page',
+              ),
+            );
+            return;
+          }
+        }
+
+        if (!_isCurrentInstanceCaptured &&
+            _isCameraActive &&
+            _cameraSessionId == sessionToken) {
+          final smoothedList =
+              _cornerSmoother.processMultiple(deduplicatedCornersList);
+
+          if (smoothedList.isNotEmpty) {
+            _lastCachedCornersList = smoothedList;
+            _lastCachedCorners = smoothedList.first;
+
+            final evaluation = _autoCaptureEngine.evaluateMultiple(
+              cornersList: smoothedList,
+              sharpnessScore: _lastSharpnessScore,
+              isAutoCaptureEnabled: state.isAutoCaptureEnabled,
+            );
+
+            if (evaluation.shouldCapture && !_isCurrentInstanceCaptured) {
+              dev.log(
+                '📸 [ScannerBloc] Auto-capture criteria met (${smoothedList.length} docs)! Snapping...',
+                name: 'YOLO',
+              );
+              add(const CapturePageEvent());
+            }
+
+            add(
+              LiveCornersDetectedEvent(
+                corners: smoothedList.first,
+                cornersList: smoothedList,
+                isDocumentLocked: evaluation.isLocked,
+                autoCaptureProgress: evaluation.lockProgress,
+                sharpnessScore: _lastSharpnessScore,
+                statusMessage: evaluation.statusReason,
+              ),
+            );
+          }
+        }
       } else {
+        // No detection in this frame: pass empty list to smoother to apply temporal persistence
+        final smoothedList = _cornerSmoother.processMultiple(const []);
         _missedDetectionCount++;
-        // Keep live corners visible for up to 2 empty frames so overlay doesn't flicker away
-        if (_missedDetectionCount >= 2) {
-          add(const ClearLiveCornersEvent());
+
+        if (smoothedList.isNotEmpty &&
+            _isCameraActive &&
+            _cameraSessionId == sessionToken) {
+          add(
+            LiveCornersDetectedEvent(
+              corners: smoothedList.first,
+              cornersList: smoothedList,
+              isDocumentLocked: false,
+              autoCaptureProgress: 0.0,
+              sharpnessScore: _lastSharpnessScore,
+              statusMessage: 'Align document within borders',
+            ),
+          );
+        } else {
+          if (_missedDetectionCount >= 2) {
+            _isCurrentInstanceCaptured = false;
+            _lastCapturedCornersList = [];
+          }
+          if (_missedDetectionCount >= 4 &&
+              _isCameraActive &&
+              _cameraSessionId == sessionToken) {
+            _cornerSmoother.reset();
+            _autoCaptureEngine.reset();
+            add(const ClearLiveCornersEvent());
+          }
         }
       }
     } catch (e) {
-      debugPrint('[ScannerBloc] _processCameraImage error: $e');
+      debugPrint('[ScannerBloc] _runPeriodicMlInference error: $e');
     }
+  }
+
+  double _computeMaxCornerDelta(CropQuadCorners a, CropQuadCorners b) {
+    final d1 = (a.topLeft - b.topLeft).distance;
+    final d2 = (a.topRight - b.topRight).distance;
+    final d3 = (a.bottomRight - b.bottomRight).distance;
+    final d4 = (a.bottomLeft - b.bottomLeft).distance;
+    return math.max(math.max(d1, d2), math.max(d3, d4));
   }
 
   void _onLiveCornersDetected(
     LiveCornersDetectedEvent event,
     Emitter<ScannerState> emit,
   ) {
-    dev.log('🟢 [ScannerBloc] State updated with liveDetectedCorners', name: 'YOLO');
     emit(
       state.copyWith(
-        liveDetectedCorners: event.corners,
-        statusMessage: 'Document detected',
+        vision: state.vision.copyWith(
+          liveDetectedCornersList: event.cornersList,
+          liveDetectedCorners: event.corners,
+          isDocumentLocked: event.isDocumentLocked,
+          autoCaptureProgress: event.autoCaptureProgress,
+          liveSharpnessScore: event.sharpnessScore,
+        ),
+        feedback: state.feedback.copyWith(
+          statusMessage: event.statusMessage ??
+              (event.isDocumentLocked ? 'Document locked' : 'Document detected'),
+        ),
       ),
     );
   }
@@ -332,12 +730,16 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
     ClearLiveCornersEvent event,
     Emitter<ScannerState> emit,
   ) {
-    if (state.liveDetectedCorners != null) {
-      dev.log('⚪ [ScannerBloc] Clearing liveDetectedCorners', name: 'YOLO');
+    if (state.liveDetectedCornersList.isNotEmpty || state.isDocumentLocked) {
+      _autoCaptureEngine.reset();
+      _cornerSmoother.reset();
+      // _visualTracker.reset();
       emit(
         state.copyWith(
-          clearLiveCorners: true,
-          statusMessage: 'Align document within borders',
+          vision: const LiveVisionState(),
+          feedback: state.feedback.copyWith(
+            statusMessage: 'Align document within borders',
+          ),
         ),
       );
     }
@@ -348,6 +750,16 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
     Emitter<ScannerState> emit,
   ) async {
     _isDisposingCamera = true;
+    _isCameraActive = false;
+    _cameraSessionId++; // Invalidate all existing frame tasks and isolate callbacks immediately
+    _isProcessingFrame = false;
+    _isCurrentInstanceCaptured = false;
+    _lastCapturedCornersList = [];
+    // _visualTracker.reset();
+    _cornerSmoother.reset();
+    _autoCaptureEngine.reset();
+    _missedDetectionCount = 0;
+
     try {
       if (_cameraController != null) {
         final controllerToDispose = _cameraController;
@@ -356,9 +768,15 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
             controllerToDispose.value.isStreamingImages) {
           try {
             await controllerToDispose.stopImageStream();
-          } catch (_) {}
+          } catch (e) {
+            debugPrint('[ScannerBloc] stopImageStream error: $e');
+          }
         }
-        await controllerToDispose?.dispose();
+        try {
+          await controllerToDispose?.dispose();
+        } catch (e) {
+          debugPrint('[ScannerBloc] controller.dispose error: $e');
+        }
       }
     } catch (e) {
       debugPrint('Camera disposal error: $e');
@@ -371,9 +789,13 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
         isCameraInitialized: false,
         isFlashOn: false,
         clearLiveCorners: true,
+        isDocumentLocked: false,
+        autoCaptureProgress: 0.0,
+        liveSharpnessScore: 0.0,
         status: state.capturedPages.isNotEmpty
             ? ScannerStatus.previewReady
             : ScannerStatus.initial,
+        statusMessage: 'Idle',
       ),
     );
   }
@@ -435,54 +857,150 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
     CapturePageEvent event,
     Emitter<ScannerState> emit,
   ) async {
-    emit(state.copyWith(status: ScannerStatus.capturing));
-
-    String capturedPath = '';
-    try {
-      if (_cameraController != null && _cameraController!.value.isInitialized) {
-        if (_cameraController!.value.isStreamingImages) {
-          try {
-            await _cameraController!.stopImageStream();
-          } catch (_) {}
-        }
-
-        final XFile file = await _cameraController!.takePicture();
-        capturedPath = file.path;
-
-        // Resume live streaming if still active
-        await _startImageStreamIfNeeded();
-      }
-    } catch (e) {
-      debugPrint('Snapshot error: $e');
-    }
-
-    // Auto-populate crop corners with detected corners if available
-    final newPageIndex = state.capturedPages.length;
-    final pageCorners = state.liveDetectedCorners ?? const CropQuadCorners();
-
-    final newPage = ScannedPage(
-      id: 'page_${DateTime.now().millisecondsSinceEpoch}_$newPageIndex',
-      imagePath: capturedPath.isNotEmpty
-          ? capturedPath
-          : 'assets/sample_document.png',
-      pageIndex: newPageIndex,
-      cropCorners: pageCorners,
-      filter: DocumentFilter.magicColor,
+    emit(
+      state.copyWith(
+        status: ScannerStatus.capturing,
+        isDocumentLocked: false,
+        autoCaptureProgress: 0.0,
+      ),
     );
 
+    _autoCaptureEngine.reset();
+    _cornerSmoother.reset();
+
+    String capturedPath = '';
+    CropQuadCorners? targetCorners;
+
+    // 1. First priority: Use the cached frame that the model actually predicted on!
+    // This gives zero shutter lag, identical field-of-view, and pixel-perfect corner alignment.
+    if (_lastCachedFramePath != null &&
+        File(_lastCachedFramePath!).existsSync() &&
+        _lastCachedCorners != null) {
+      try {
+        final appDir = await getApplicationDocumentsDirectory();
+        final rawDir = Directory('${appDir.path}/doc_scanner_storage/raw');
+        if (!rawDir.existsSync()) rawDir.createSync(recursive: true);
+        final uniquePath =
+            '${rawDir.path}/raw_${DateTime.now().millisecondsSinceEpoch}.jpg';
+        await File(_lastCachedFramePath!).copy(uniquePath);
+        capturedPath = uniquePath;
+        targetCorners = _lastCachedCorners;
+        dev.log(
+          '🎯 [ScannerBloc] Zero-lag capture: Using model-predicted frame $capturedPath',
+          name: 'YOLO',
+        );
+      } catch (e) {
+        debugPrint('[ScannerBloc] Error copying cached frame: $e');
+        capturedPath = _lastCachedFramePath!;
+        targetCorners = _lastCachedCorners;
+      }
+    }
+
+    // 2. Fallback: Hardware camera snapshot if no cached frame was available
+    if (capturedPath.isEmpty) {
+      try {
+        if (_cameraController != null &&
+            _cameraController!.value.isInitialized) {
+          if (_cameraController!.value.isStreamingImages) {
+            try {
+              await _cameraController!.stopImageStream();
+            } catch (_) {}
+          }
+
+          final XFile file = await _cameraController!.takePicture();
+          capturedPath = file.path;
+          targetCorners = state.liveDetectedCorners;
+        }
+      } catch (e) {
+        debugPrint('Snapshot fallback error: $e');
+      }
+    }
+
+    // High-Accuracy Multi-Object Auto-Crop:
+    // Gather all target quads (from cached model detections or live state)
+    final List<CropQuadCorners> targetCornersList = [];
+    if (_lastCachedCornersList.isNotEmpty) {
+      targetCornersList.addAll(_lastCachedCornersList);
+    } else if (state.liveDetectedCornersList.isNotEmpty) {
+      targetCornersList.addAll(state.liveDetectedCornersList);
+    } else if (targetCorners != null) {
+      targetCornersList.add(targetCorners);
+    }
+
+    final int basePageIndex = state.capturedPages.length;
+    final List<ScannedPage> newPages = [];
+
+    if (capturedPath.isNotEmpty && targetCornersList.isNotEmpty) {
+      for (int i = 0; i < targetCornersList.length; i++) {
+        final corners = targetCornersList[i];
+        final pageIdx = basePageIndex + i;
+        final cropped = await _cropService.cropImage(
+          sourceImagePath: capturedPath,
+          topLeft: corners.topLeft,
+          topRight: corners.topRight,
+          bottomRight: corners.bottomRight,
+          bottomLeft: corners.bottomLeft,
+        );
+
+        newPages.add(
+          ScannedPage(
+            id: 'page_${DateTime.now().millisecondsSinceEpoch}_$pageIdx',
+            imagePath: cropped ?? capturedPath,
+            originalImagePath: capturedPath.isNotEmpty ? capturedPath : null,
+            pageIndex: pageIdx,
+            cropCorners: cropped != null ? const CropQuadCorners() : corners,
+            filter: DocumentFilter.original,
+          ),
+        );
+      }
+    } else {
+      // Fallback: 0 detections, save full image
+      final pageIdx = basePageIndex;
+      final fallbackImage = capturedPath.isNotEmpty
+          ? capturedPath
+          : 'assets/sample_document.png';
+      newPages.add(
+        ScannedPage(
+          id: 'page_${DateTime.now().millisecondsSinceEpoch}_$pageIdx',
+          imagePath: fallbackImage,
+          originalImagePath: capturedPath.isNotEmpty ? capturedPath : null,
+          pageIndex: pageIdx,
+          cropCorners: const CropQuadCorners(),
+          filter: DocumentFilter.original,
+        ),
+      );
+    }
+
+    // Instance-based Lock: Mark these document instances as captured so they won't detect again
+    _isCurrentInstanceCaptured = true;
+    _lastCapturedCornersList = List.from(targetCornersList);
+
     final updatedPages = List<ScannedPage>.from(state.capturedPages)
-      ..add(newPage);
+      ..addAll(newPages);
+
+    final lastPageIndex = updatedPages.length - 1;
+    final docsCount = newPages.length;
 
     emit(
       state.copyWith(
         status: ScannerStatus.cameraReady,
         capturedPages: updatedPages,
-        selectedPageIndex: newPageIndex,
-        statusMessage: state.liveDetectedCorners != null
-            ? 'Page ${newPageIndex + 1} captured (Auto-detected)'
-            : 'Page ${newPageIndex + 1} captured',
+        selectedPageIndex: lastPageIndex,
+        clearLiveCorners: true,
+        isDocumentLocked: false,
+        autoCaptureProgress: 0.0,
+        statusMessage: docsCount > 1
+            ? '$docsCount documents auto-cropped • Ready for next page'
+            : 'Page ${lastPageIndex + 1} auto-cropped • Ready for next page',
       ),
     );
+
+    // Resume image streaming only after photo inference and cropping complete
+    if (_isCameraActive &&
+        _cameraController != null &&
+        _cameraController!.value.isInitialized) {
+      await _startImageStreamIfNeeded();
+    }
   }
 
   void _onSelectPageForEditing(
@@ -591,16 +1109,27 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
   }
 
   void _onRotatePage(RotatePageEvent event, Emitter<ScannerState> emit) {
-    if (state.currentPage == null) return;
+    final targetIndex = event.pageIndex ?? state.selectedPageIndex;
+    if (state.capturedPages.isEmpty ||
+        targetIndex < 0 ||
+        targetIndex >= state.capturedPages.length) {
+      return;
+    }
 
-    final newDegrees = (state.currentPage!.rotationDegrees + 90) % 360;
-    final updatedPage = state.currentPage!.copyWith(
+    final targetPage = state.capturedPages[targetIndex];
+    final newDegrees = (targetPage.rotationDegrees + 90) % 360;
+    final updatedPage = targetPage.copyWith(
       rotationDegrees: newDegrees,
     );
     final updatedList = List<ScannedPage>.from(state.capturedPages);
-    updatedList[state.selectedPageIndex] = updatedPage;
+    updatedList[targetIndex] = updatedPage;
 
-    emit(state.copyWith(capturedPages: updatedList));
+    emit(
+      state.copyWith(
+        capturedPages: updatedList,
+        selectedPageIndex: targetIndex,
+      ),
+    );
   }
 
   void _onDeletePage(DeletePageEvent event, Emitter<ScannerState> emit) {
@@ -633,7 +1162,17 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
   ) async {
     try {
       final docs = await _storageService.loadAllDocuments();
-      emit(state.copyWith(recentDocuments: docs));
+      emit(
+        state.copyWith(
+          recentDocuments: docs,
+          isCameraInitialized: false,
+          clearLiveCorners: true,
+          isDocumentLocked: false,
+          autoCaptureProgress: 0.0,
+          liveSharpnessScore: 0.0,
+          statusMessage: 'Idle',
+        ),
+      );
     } catch (e) {
       debugPrint('Error loading saved documents in bloc: $e');
     }
@@ -673,7 +1212,7 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
             id: state.editingDocumentId!,
             title: event.title.trim().isNotEmpty
                 ? event.title.trim()
-                : 'Scan ${DateTime.now().day}/${DateTime.now().month}/${DateTime.now().year}',
+                : ScannedDocument.generateDefaultTitle(),
             createdAt: DateTime.now(),
             pages: List<ScannedPage>.from(state.capturedPages),
             scanMode: state.activeScanMode,
@@ -685,7 +1224,7 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
           id: 'doc_${DateTime.now().millisecondsSinceEpoch}',
           title: event.title.trim().isNotEmpty
               ? event.title.trim()
-              : 'Scan ${DateTime.now().day}/${DateTime.now().month}/${DateTime.now().year}',
+              : ScannedDocument.generateDefaultTitle(),
           createdAt: DateTime.now(),
           pages: List<ScannedPage>.from(state.capturedPages),
           scanMode: state.activeScanMode,
@@ -746,7 +1285,7 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
       } else if (state.capturedPages.isNotEmpty) {
         final title = event.title?.trim().isNotEmpty == true
             ? event.title!.trim()
-            : 'Scan_${DateTime.now().day}_${DateTime.now().month}_${DateTime.now().year}';
+            : ScannedDocument.generateDefaultTitle();
         docToShare = ScannedDocument(
           id: 'temp_share_${DateTime.now().millisecondsSinceEpoch}',
           title: title,
@@ -864,6 +1403,10 @@ class ScannerBloc extends Bloc<ScannerEvent, ScannerState> {
   }
 
   void _onResetScanner(ResetScannerEvent event, Emitter<ScannerState> emit) {
+    _isCurrentInstanceCaptured = false;
+    _lastCapturedCornersList = [];
+    _cornerSmoother.reset();
+    _autoCaptureEngine.reset();
     emit(
       state.copyWith(
         status: ScannerStatus.cameraReady,

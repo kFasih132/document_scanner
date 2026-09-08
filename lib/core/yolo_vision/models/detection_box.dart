@@ -57,13 +57,26 @@ class DetectionBox {
 
   /// Calculates Intersection over Union (IoU) with another box
   double calculateIou(DetectionBox other) {
+    final intersection = calculateIntersectionArea(other);
+    final union = area + other.area - intersection;
+    return union <= 0.0 ? 0.0 : intersection / union;
+  }
+
+  /// Calculates Intersection Area with another box
+  double calculateIntersectionArea(DetectionBox other) {
     final ix1 = math.max(x1, other.x1);
     final iy1 = math.max(y1, other.y1);
     final ix2 = math.min(x2, other.x2);
     final iy2 = math.min(y2, other.y2);
+    return math.max(0.0, ix2 - ix1) * math.max(0.0, iy2 - iy1);
+  }
 
-    final intersection = math.max(0.0, ix2 - ix1) * math.max(0.0, iy2 - iy1);
-    final union = area + other.area - intersection;
-    return union <= 0.0 ? 0.0 : intersection / union;
+  /// Calculates Overlap Coefficient (Szymkiewicz-Simpson coefficient):
+  /// Intersection / min(Area1, Area2).
+  /// Detects if one box is substantially inside or overlapping another box.
+  double calculateOverlapCoefficient(DetectionBox other) {
+    final minA = math.min(area, other.area);
+    if (minA <= 0.0) return 0.0;
+    return calculateIntersectionArea(other) / minA;
   }
 }

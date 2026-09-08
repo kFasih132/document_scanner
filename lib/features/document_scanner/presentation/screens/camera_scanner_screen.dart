@@ -1,6 +1,8 @@
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_spacing.dart';
 import '../../../../core/utils/responsive_layout.dart';
@@ -12,17 +14,39 @@ import '../widgets/batch_thumbnail_tray.dart';
 import '../widgets/camera_controls_header.dart';
 import '../widgets/camera_shutter_button.dart';
 import '../widgets/camera_viewfinder.dart';
-import 'document_crop_screen.dart';
 import 'document_preview_screen.dart';
 
 class CameraScannerScreen extends StatefulWidget {
   const CameraScannerScreen({super.key});
 
+  /// Safely disposes camera hardware and halts all YOLO predictions before
+  /// displaying a full-screen image view (crop/preview), then cleanly re-initializes
+  /// the camera and resumes predictions upon return.
+  static Future<void> openFullScreenView(
+    BuildContext context,
+    Widget destinationScreen,
+  ) async {
+    final bloc = context.read<ScannerBloc>();
+    // Halt YOLO predictions and release camera hardware
+    bloc.add(const DisposeCameraEvent());
+
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => destinationScreen),
+    );
+
+    // ONLY re-initialize camera if the CameraScannerScreen route is STILL ACTIVE at the top of the stack!
+    if (context.mounted && ModalRoute.of(context)?.isCurrent == true) {
+      bloc.add(const InitializeCameraEvent());
+    }
+  }
+
   @override
   State<CameraScannerScreen> createState() => _CameraScannerScreenState();
 }
 
-class _CameraScannerScreenState extends State<CameraScannerScreen> with WidgetsBindingObserver {
+class _CameraScannerScreenState extends State<CameraScannerScreen>
+    with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
@@ -43,7 +67,8 @@ class _CameraScannerScreenState extends State<CameraScannerScreen> with WidgetsB
   void didChangeAppLifecycleState(AppLifecycleState lifecycleState) {
     if (!mounted) return;
     final bloc = context.read<ScannerBloc>();
-    if (lifecycleState == AppLifecycleState.inactive || lifecycleState == AppLifecycleState.paused) {
+    if (lifecycleState == AppLifecycleState.inactive ||
+        lifecycleState == AppLifecycleState.paused) {
       bloc.add(const DisposeCameraEvent());
     } else if (lifecycleState == AppLifecycleState.resumed) {
       bloc.add(const InitializeCameraEvent());
@@ -52,34 +77,32 @@ class _CameraScannerScreenState extends State<CameraScannerScreen> with WidgetsB
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: BlocConsumer<ScannerBloc, ScannerState>(
-        listener: (context, state) {
-          if (state.errorMessage != null) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text(state.errorMessage!)),
-            );
-          }
-        },
-        builder: (context, state) {
-          final bloc = context.read<ScannerBloc>();
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) return;
+        // Cleanly release hardware camera and halt predictions on pop
+        context.read<ScannerBloc>().add(const DisposeCameraEvent());
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: BlocConsumer<ScannerBloc, ScannerState>(
+          listener: (context, state) {
+            if (state.errorMessage != null) {
+              ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(content: Text(state.errorMessage!)));
+            }
+          },
+          builder: (context, state) {
+            final bloc = context.read<ScannerBloc>();
 
-          return ResponsiveLayout(
-            mobile: MobileCameraLayout(
-              state: state,
-              bloc: bloc,
-            ),
-            tablet7Inch: TabletCameraLayout(
-              state: state,
-              bloc: bloc,
-            ),
-            tablet10Inch: TabletCameraLayout(
-              state: state,
-              bloc: bloc,
-            ),
-          );
-        },
+            return ResponsiveLayout(
+              mobile: MobileCameraLayout(state: state, bloc: bloc),
+              tablet7Inch: TabletCameraLayout(state: state, bloc: bloc),
+              tablet10Inch: TabletCameraLayout(state: state, bloc: bloc),
+            );
+          },
+        ),
       ),
     );
   }
@@ -105,7 +128,10 @@ class MobileCameraLayout extends StatelessWidget {
             controller: bloc.cameraController,
             isInitialized: state.isCameraInitialized,
             statusMessage: state.statusMessage ?? 'Align document',
+            liveCornersList: state.liveDetectedCornersList,
             liveCorners: state.liveDetectedCorners,
+            isLocked: state.isDocumentLocked,
+            lockProgress: state.autoCaptureProgress,
           ),
         ),
 
@@ -117,9 +143,28 @@ class MobileCameraLayout extends StatelessWidget {
           child: CameraControlsHeader(
             isFlashOn: state.isFlashOn,
             isAutoCapture: state.isAutoCaptureEnabled,
-            onClose: () => Navigator.pop(context),
+            activeModel: state.activeModel,
+            onSelectModel: (model) => bloc.add(SwitchScannerModelEvent(model)),
+            isModelLoading: !state.isModelLoaded,
+            onClose: () {
+              bloc.add(const DisposeCameraEvent());
+              Navigator.pop(context);
+            },
             onToggleFlash: () => bloc.add(const ToggleFlashEvent()),
             onToggleAutoCapture: () => bloc.add(const ToggleAutoCaptureEvent()),
+          ),
+        ),
+
+        // Status & Guidance Badge — Positioned safely BELOW Top Controls Header
+        Positioned(
+          top: MediaQuery.of(context).padding.top + 64,
+          left: AppSpacing.md,
+          right: AppSpacing.md,
+          child: Center(
+            child: ViewfinderStatusBadge(
+              message: state.statusMessage ?? 'Align document within borders',
+              isLocked: state.isDocumentLocked,
+            ),
           ),
         ),
 
@@ -128,10 +173,7 @@ class MobileCameraLayout extends StatelessWidget {
           bottom: 0,
           left: 0,
           right: 0,
-          child: MobileBottomBar(
-            state: state,
-            bloc: bloc,
-          ),
+          child: MobileBottomBar(state: state, bloc: bloc),
         ),
       ],
     );
@@ -142,11 +184,7 @@ class MobileBottomBar extends StatelessWidget {
   final ScannerState state;
   final ScannerBloc bloc;
 
-  const MobileBottomBar({
-    super.key,
-    required this.state,
-    required this.bloc,
-  });
+  const MobileBottomBar({super.key, required this.state, required this.bloc});
 
   @override
   Widget build(BuildContext context) {
@@ -155,11 +193,7 @@ class MobileBottomBar extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.bottomCenter,
           end: Alignment.topCenter,
-          colors: [
-            Colors.black,
-            Colors.black87,
-            Colors.transparent,
-          ],
+          colors: [Colors.black, Colors.black87, Colors.transparent],
         ),
       ),
       child: SafeArea(
@@ -173,24 +207,16 @@ class MobileBottomBar extends StatelessWidget {
                 pages: state.capturedPages,
                 onPageTapped: (index) {
                   bloc.add(SelectPageForEditingEvent(index));
-                  Navigator.push(
+                  CameraScannerScreen.openFullScreenView(
                     context,
-                    MaterialPageRoute(
-                      builder: (context) => const DocumentCropScreen(),
-                    ),
-                  ).then((_) {
-                    bloc.add(const InitializeCameraEvent());
-                  });
+                    DocumentPreviewScreen(initialPageIndex: index),
+                  );
                 },
                 onReviewAll: () {
-                  Navigator.push(
+                  CameraScannerScreen.openFullScreenView(
                     context,
-                    MaterialPageRoute(
-                      builder: (context) => const DocumentPreviewScreen(),
-                    ),
-                  ).then((_) {
-                    bloc.add(const InitializeCameraEvent());
-                  });
+                    const DocumentPreviewScreen(initialPageIndex: 0),
+                  );
                 },
               ),
               const SizedBox(height: AppSpacing.sm),
@@ -213,14 +239,12 @@ class MobileBottomBar extends StatelessWidget {
                     pageCount: state.pageCount,
                     onTap: () {
                       if (state.capturedPages.isNotEmpty) {
-                        Navigator.push(
+                        final lastIdx = state.capturedPages.length - 1;
+                        bloc.add(SelectPageForEditingEvent(lastIdx));
+                        CameraScannerScreen.openFullScreenView(
                           context,
-                          MaterialPageRoute(
-                            builder: (context) => const DocumentPreviewScreen(),
-                          ),
-                        ).then((_) {
-                          bloc.add(const InitializeCameraEvent());
-                        });
+                          DocumentPreviewScreen(initialPageIndex: lastIdx),
+                        );
                       }
                     },
                   ),
@@ -236,14 +260,10 @@ class MobileBottomBar extends StatelessWidget {
                   CameraProceedButton(
                     enabled: state.capturedPages.isNotEmpty,
                     onPressed: () {
-                      Navigator.push(
+                      CameraScannerScreen.openFullScreenView(
                         context,
-                        MaterialPageRoute(
-                          builder: (context) => const DocumentPreviewScreen(),
-                        ),
-                      ).then((_) {
-                        bloc.add(const InitializeCameraEvent());
-                      });
+                        const DocumentPreviewScreen(initialPageIndex: 0),
+                      );
                     },
                   ),
                 ],
@@ -281,7 +301,10 @@ class TabletCameraLayout extends StatelessWidget {
                   controller: bloc.cameraController,
                   isInitialized: state.isCameraInitialized,
                   statusMessage: state.statusMessage ?? 'Align document',
+                  liveCornersList: state.liveDetectedCornersList,
                   liveCorners: state.liveDetectedCorners,
+                  isLocked: state.isDocumentLocked,
+                  lockProgress: state.autoCaptureProgress,
                 ),
               ),
               Positioned(
@@ -291,9 +314,29 @@ class TabletCameraLayout extends StatelessWidget {
                 child: CameraControlsHeader(
                   isFlashOn: state.isFlashOn,
                   isAutoCapture: state.isAutoCaptureEnabled,
-                  onClose: () => Navigator.pop(context),
+                  activeModel: state.activeModel,
+                  onSelectModel: (model) =>
+                      bloc.add(SwitchScannerModelEvent(model)),
+                  isModelLoading: !state.isModelLoaded,
+                  onClose: () {
+                    bloc.add(const DisposeCameraEvent());
+                    Navigator.pop(context);
+                  },
                   onToggleFlash: () => bloc.add(const ToggleFlashEvent()),
-                  onToggleAutoCapture: () => bloc.add(const ToggleAutoCaptureEvent()),
+                  onToggleAutoCapture: () =>
+                      bloc.add(const ToggleAutoCaptureEvent()),
+                ),
+              ),
+              // Prominent Status & Guidance Badge — Positioned safely BELOW Top Controls Header
+              Positioned(
+                top: MediaQuery.of(context).padding.top + 64,
+                left: AppSpacing.md,
+                right: AppSpacing.md,
+                child: Center(
+                  child: ViewfinderStatusBadge(
+                    message: state.statusMessage ?? 'Align document within borders',
+                    isLocked: state.isDocumentLocked,
+                  ),
                 ),
               ),
             ],
@@ -341,14 +384,10 @@ class TabletCameraLayout extends StatelessWidget {
                   if (state.capturedPages.isNotEmpty)
                     FilledButton.icon(
                       onPressed: () {
-                        Navigator.push(
+                        CameraScannerScreen.openFullScreenView(
                           context,
-                          MaterialPageRoute(
-                            builder: (context) => const DocumentPreviewScreen(),
-                          ),
-                        ).then((_) {
-                          bloc.add(const InitializeCameraEvent());
-                        });
+                          const DocumentPreviewScreen(initialPageIndex: 0),
+                        );
                       },
                       style: FilledButton.styleFrom(
                         backgroundColor: AppColors.scannerLaser,
@@ -412,10 +451,7 @@ class RecentCaptureThumbnailButton extends StatelessWidget {
               ClipRRect(
                 borderRadius: AppSpacing.roundedFull,
                 child: isLocalFile
-                    ? Image.file(
-                        File(lastPage!.imagePath),
-                        fit: BoxFit.cover,
-                      )
+                    ? Image.file(File(lastPage!.imagePath), fit: BoxFit.cover)
                     : Container(
                         color: Colors.white24,
                         child: const Icon(
@@ -435,7 +471,10 @@ class RecentCaptureThumbnailButton extends StatelessWidget {
                 top: -2,
                 right: -2,
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 5,
+                    vertical: 1,
+                  ),
                   decoration: const BoxDecoration(
                     color: AppColors.primary,
                     shape: BoxShape.circle,

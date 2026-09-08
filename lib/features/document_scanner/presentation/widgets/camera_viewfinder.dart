@@ -10,6 +10,10 @@ class CameraViewfinder extends StatelessWidget {
   final bool isInitialized;
   final String statusMessage;
   final CropQuadCorners? liveCorners;
+  final List<CropQuadCorners> liveCornersList;
+  final bool isLocked;
+  final double lockProgress;
+  final bool showEmbeddedStatusBadge;
 
   const CameraViewfinder({
     super.key,
@@ -17,44 +21,79 @@ class CameraViewfinder extends StatelessWidget {
     required this.isInitialized,
     required this.statusMessage,
     this.liveCorners,
+    this.liveCornersList = const [],
+    this.isLocked = false,
+    this.lockProgress = 0.0,
+    this.showEmbeddedStatusBadge = false,
   });
 
   @override
   Widget build(BuildContext context) {
+    final corners = liveCornersList.isNotEmpty
+        ? liveCornersList
+        : (liveCorners != null ? [liveCorners!] : const <CropQuadCorners>[]);
+
     return ClipRRect(
       borderRadius: AppSpacing.roundedLg,
       child: Stack(
         fit: StackFit.expand,
         children: [
-          // Live Camera Preview or Simulated Viewport
+          // Live Camera Preview with pixel-perfect quadrilateral overlay alignment
           if (controller != null && controller!.value.isInitialized)
-            CameraPreview(controller!)
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final cameraAspectRatio = 1 / controller!.value.aspectRatio;
+                final boxWidth = constraints.maxWidth;
+                final boxHeight = boxWidth / cameraAspectRatio;
+
+                return ClipRect(
+                  child: OverflowBox(
+                    alignment: Alignment.center,
+                    child: FittedBox(
+                      fit: BoxFit.cover,
+                      child: SizedBox(
+                        width: boxWidth,
+                        height: boxHeight,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            CameraPreview(controller!),
+                            if (corners.isNotEmpty)
+                              Positioned.fill(
+                                child: CustomPaint(
+                                  painter: LiveDocumentQuadPainter(
+                                    cornersList: corners,
+                                    primaryColor: AppColors.cropHandle,
+                                    lockedColor: const Color(0xFF00E676),
+                                    isLocked: isLocked,
+                                    lockProgress: lockProgress,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            )
           else
             const SimulatedCameraFeed(),
 
-          // Clean Document Guide Frame (White corner guides)
-          const DocumentGuideOverlay(),
-
-          // Live AI Detected Quadrilateral Overlay
-          if (liveCorners != null)
-            Positioned.fill(
-              child: CustomPaint(
-                painter: LiveDocumentQuadPainter(
-                  corners: liveCorners!,
-                  primaryColor: AppColors.cropHandle,
+          // Status & Guidance Badge (rendered embedded only if requested)
+          if (showEmbeddedStatusBadge)
+            Positioned(
+              top: AppSpacing.xl,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: ViewfinderStatusBadge(
+                  message: statusMessage,
+                  isLocked: isLocked,
                 ),
               ),
             ),
-
-          // Status & Guidance Badge
-          Positioned(
-            top: AppSpacing.xl,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: ViewfinderStatusBadge(message: statusMessage),
-            ),
-          ),
         ],
       ),
     );
@@ -95,36 +134,51 @@ class SimulatedCameraFeed extends StatelessWidget {
 
 class ViewfinderStatusBadge extends StatelessWidget {
   final String message;
+  final bool isLocked;
 
-  const ViewfinderStatusBadge({super.key, required this.message});
+  const ViewfinderStatusBadge({
+    super.key,
+    required this.message,
+    this.isLocked = false,
+  });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
       padding: const EdgeInsets.symmetric(
         horizontal: AppSpacing.md,
         vertical: AppSpacing.xs + 2,
       ),
       decoration: BoxDecoration(
-        color: AppColors.cameraOverlayDark,
+        color: isLocked
+            ? const Color(0xFF00E676).withValues(alpha: 0.85)
+            : AppColors.cameraOverlayDark,
         borderRadius: AppSpacing.roundedFull,
-        border: Border.all(color: Colors.white24, width: 1),
+        border: Border.all(
+          color: isLocked ? Colors.white : Colors.white24,
+          width: isLocked ? 1.5 : 1.0,
+        ),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(
-            Icons.document_scanner_outlined,
+          Icon(
+            isLocked ? Icons.check_circle_outline : Icons.document_scanner_outlined,
             size: 14,
             color: Colors.white,
           ),
           const SizedBox(width: AppSpacing.sm),
-          Text(
-            message,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
+          Flexible(
+            child: Text(
+              message,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
         ],

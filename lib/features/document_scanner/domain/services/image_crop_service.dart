@@ -35,127 +35,132 @@ class ImageCropService {
       }
 
       final bytes = await sourceFile.readAsBytes();
-      img.Image? decoded = img.decodeImage(bytes);
-      if (decoded == null) {
-        debugPrint(
-          'ImageCropService: Failed to decode image: $sourceImagePath',
-        );
-        return null;
-      }
-
-      // Bake EXIF orientation so pixel coordinates match the visual display.
-      decoded = img.bakeOrientation(decoded);
-
-      final srcW = decoded.width.toDouble();
-      final srcH = decoded.height.toDouble();
-
-      // Convert normalised corners to pixel coordinates.
-      final p0 = Offset(topLeft.dx * srcW, topLeft.dy * srcH); // TL
-      final p1 = Offset(topRight.dx * srcW, topRight.dy * srcH); // TR
-      final p2 = Offset(bottomRight.dx * srcW, bottomRight.dy * srcH); // BR
-      final p3 = Offset(bottomLeft.dx * srcW, bottomLeft.dy * srcH); // BL
-
-      // Determine output size: average of the four side lengths.
-      final topWidth = (p1 - p0).distance;
-      final bottomWidth = (p2 - p3).distance;
-      final leftHeight = (p3 - p0).distance;
-      final rightHeight = (p2 - p1).distance;
-
-      final outW =
-          math.max(1, ((topWidth + bottomWidth) / 2).round());
-      final outH =
-          math.max(1, ((leftHeight + rightHeight) / 2).round());
-
-      // Compute the 3×3 perspective homography matrix H that maps each
-      // destination pixel (dx, dy) → source pixel (sx, sy).
-      // We solve using the Direct Linear Transform on the 4 corner correspondences.
-      final h = _computeHomography(
-        srcPoints: [p0, p1, p2, p3],
-        dstW: outW.toDouble(),
-        dstH: outH.toDouble(),
-      );
-
-      // Allocate output image and fill via inverse mapping.
-      final output = img.Image(width: outW, height: outH);
-
-      for (int dy = 0; dy < outH; dy++) {
-        for (int dx = 0; dx < outW; dx++) {
-          // Apply H to get the source coordinates.
-          final src = _applyHomography(h, dx.toDouble(), dy.toDouble());
-          final sx = src.dx;
-          final sy = src.dy;
-
-          if (sx < 0 || sy < 0 || sx >= srcW || sy >= srcH) {
-            output.setPixelRgba(dx, dy, 255, 255, 255, 255);
-            continue;
-          }
-
-          // Bilinear interpolation for smooth output.
-          final x0 = sx.floor().clamp(0, decoded.width - 1);
-          final y0 = sy.floor().clamp(0, decoded.height - 1);
-          final x1 = (x0 + 1).clamp(0, decoded.width - 1);
-          final y1 = (y0 + 1).clamp(0, decoded.height - 1);
-          final fx = sx - x0;
-          final fy = sy - y0;
-
-          final c00 = decoded.getPixel(x0, y0);
-          final c10 = decoded.getPixel(x1, y0);
-          final c01 = decoded.getPixel(x0, y1);
-          final c11 = decoded.getPixel(x1, y1);
-
-          int lerpChannel(num a, num b, double t) =>
-              (a + (b - a) * t).round().clamp(0, 255);
-
-          final r = lerpChannel(
-            lerpChannel(c00.r, c10.r, fx),
-            lerpChannel(c01.r, c11.r, fx),
-            fy,
-          );
-          final g = lerpChannel(
-            lerpChannel(c00.g, c10.g, fx),
-            lerpChannel(c01.g, c11.g, fx),
-            fy,
-          );
-          final b = lerpChannel(
-            lerpChannel(c00.b, c10.b, fx),
-            lerpChannel(c01.b, c11.b, fx),
-            fy,
-          );
-
-          output.setPixelRgba(dx, dy, r, g, b, 255);
-        }
-      }
-
-      // Apply any additional rotation requested by the user.
-      img.Image result = output;
-      if (rotationDegrees % 360 != 0) {
-        result = img.copyRotate(result, angle: rotationDegrees.toDouble());
-      }
-
-      // Encode to high-quality JPEG.
-      final croppedBytes = img.encodeJpg(result, quality: 92);
-
-      // Persist to the app's private documents directory.
       final appDir = await getApplicationDocumentsDirectory();
-      final croppedDir =
-          Directory('${appDir.path}/doc_scanner_storage/cropped');
+      final croppedDir = Directory('${appDir.path}/doc_scanner_storage/cropped');
       if (!await croppedDir.exists()) {
         await croppedDir.create(recursive: true);
       }
 
       final fileName = 'cropped_${DateTime.now().millisecondsSinceEpoch}.jpg';
       final croppedFile = File('${croppedDir.path}/$fileName');
-      await croppedFile.writeAsBytes(croppedBytes);
 
-      debugPrint(
-        'ImageCropService: cropped → ${croppedFile.path} '
-        '(${outW}x$outH from ${srcW.toInt()}x${srcH.toInt()})',
-      );
+      // Execute heavy perspective warp and bilinear sampling in background isolate
+      final croppedBytes = await compute(_warpWorker, {
+        'bytes': bytes,
+        'tl_dx': topLeft.dx,
+        'tl_dy': topLeft.dy,
+        'tr_dx': topRight.dx,
+        'tr_dy': topRight.dy,
+        'br_dx': bottomRight.dx,
+        'br_dy': bottomRight.dy,
+        'bl_dx': bottomLeft.dx,
+        'bl_dy': bottomLeft.dy,
+        'rotation': rotationDegrees,
+      });
+
+      if (croppedBytes == null) return null;
+
+      await croppedFile.writeAsBytes(croppedBytes);
+      debugPrint('ImageCropService: cropped successfully → ${croppedFile.path}');
       return croppedFile.path;
     } catch (e, stack) {
       debugPrint('ImageCropService error: $e\n$stack');
       return null;
     }
+  }
+
+  static Uint8List? _warpWorker(Map<String, dynamic> params) {
+    final Uint8List rawBytes = params['bytes'] as Uint8List;
+    final double tlDx = params['tl_dx'] as double;
+    final double tlDy = params['tl_dy'] as double;
+    final double trDx = params['tr_dx'] as double;
+    final double trDy = params['tr_dy'] as double;
+    final double brDx = params['br_dx'] as double;
+    final double brDy = params['br_dy'] as double;
+    final double blDx = params['bl_dx'] as double;
+    final double blDy = params['bl_dy'] as double;
+    final int rotationDegrees = params['rotation'] as int;
+
+    img.Image? decoded = img.decodeImage(rawBytes);
+    if (decoded == null) return null;
+
+    // Do NOT rotate before crop: crop directly on the native frame coordinates
+    final srcW = decoded.width.toDouble();
+    final srcH = decoded.height.toDouble();
+
+    final p0 = Offset(tlDx * srcW, tlDy * srcH); // TL
+    final p1 = Offset(trDx * srcW, trDy * srcH); // TR
+    final p2 = Offset(brDx * srcW, brDy * srcH); // BR
+    final p3 = Offset(blDx * srcW, blDy * srcH); // BL
+
+    final topWidth = (p1 - p0).distance;
+    final bottomWidth = (p2 - p3).distance;
+    final leftHeight = (p3 - p0).distance;
+    final rightHeight = (p2 - p1).distance;
+
+    final outW = math.max(1, ((topWidth + bottomWidth) / 2).round());
+    final outH = math.max(1, ((leftHeight + rightHeight) / 2).round());
+
+    final h = _computeHomography(
+      srcPoints: [p0, p1, p2, p3],
+      dstW: outW.toDouble(),
+      dstH: outH.toDouble(),
+    );
+
+    final output = img.Image(width: outW, height: outH);
+
+    for (int dy = 0; dy < outH; dy++) {
+      for (int dx = 0; dx < outW; dx++) {
+        final src = _applyHomography(h, dx.toDouble(), dy.toDouble());
+        final sx = src.dx;
+        final sy = src.dy;
+
+        if (sx < 0 || sy < 0 || sx >= srcW || sy >= srcH) {
+          output.setPixelRgba(dx, dy, 255, 255, 255, 255);
+          continue;
+        }
+
+        final x0 = sx.floor().clamp(0, decoded.width - 1);
+        final y0 = sy.floor().clamp(0, decoded.height - 1);
+        final x1 = (x0 + 1).clamp(0, decoded.width - 1);
+        final y1 = (y0 + 1).clamp(0, decoded.height - 1);
+        final fx = sx - x0;
+        final fy = sy - y0;
+
+        final c00 = decoded.getPixel(x0, y0);
+        final c10 = decoded.getPixel(x1, y0);
+        final c01 = decoded.getPixel(x0, y1);
+        final c11 = decoded.getPixel(x1, y1);
+
+        int lerpChannel(num a, num b, double t) =>
+            (a + (b - a) * t).round().clamp(0, 255);
+
+        final r = lerpChannel(
+          lerpChannel(c00.r, c10.r, fx),
+          lerpChannel(c01.r, c11.r, fx),
+          fy,
+        );
+        final g = lerpChannel(
+          lerpChannel(c00.g, c10.g, fx),
+          lerpChannel(c01.g, c11.g, fx),
+          fy,
+        );
+        final b = lerpChannel(
+          lerpChannel(c00.b, c10.b, fx),
+          lerpChannel(c01.b, c11.b, fx),
+          fy,
+        );
+
+        output.setPixelRgba(dx, dy, r, g, b, 255);
+      }
+    }
+
+    img.Image result = output;
+    if (rotationDegrees % 360 != 0) {
+      result = img.copyRotate(result, angle: rotationDegrees.toDouble());
+    }
+
+    return Uint8List.fromList(img.encodeJpg(result, quality: 92));
   }
 
   // ---------------------------------------------------------------------------
@@ -165,27 +170,19 @@ class ImageCropService {
   /// Computes the 3×3 homography matrix H (stored as a flat 9-element list)
   /// mapping destination rectangle [0,dstW] × [0,dstH] → source quad
   /// [p0=TL, p1=TR, p2=BR, p3=BL].
-  ///
-  /// Uses the standard 8-DOF DLT formulation and solves with Gaussian
-  /// elimination (no external linear-algebra library required).
-  List<double> _computeHomography({
+  static List<double> _computeHomography({
     required List<Offset> srcPoints, // [TL, TR, BR, BL] in source pixels
     required double dstW,
     required double dstH,
   }) {
-    // Destination corners corresponding to src[0..3]:
-    //   dst TL = (0,    0   )
-    //   dst TR = (dstW, 0   )
-    //   dst BR = (dstW, dstH)
-    //   dst BL = (0,    dstH)
     final dstPts = [
-      Offset(0, 0),
+      const Offset(0, 0),
       Offset(dstW, 0),
       Offset(dstW, dstH),
       Offset(0, dstH),
     ];
 
-    // Build 8×8 system A·h = b  (8 unknowns, h8 = 1 normalised).
+    // Build 8×8 system A·h = b (8 unknowns, h8 = 1 normalised).
     final A = List.generate(8, (_) => List<double>.filled(8, 0.0));
     final bVec = List<double>.filled(8, 0.0);
 
@@ -195,7 +192,7 @@ class ImageCropService {
       final dx = dstPts[i].dx;
       final dy = dstPts[i].dy;
 
-      // Row 2i:   sx = (h0·dx + h1·dy + h2) / (h6·dx + h7·dy + 1)
+      // Row 2i: sx = (h0·dx + h1·dy + h2) / (h6·dx + h7·dy + 1)
       A[2 * i][0] = dx;
       A[2 * i][1] = dy;
       A[2 * i][2] = 1;
@@ -219,13 +216,11 @@ class ImageCropService {
     }
 
     final h = _gaussianElimination(A, bVec);
-    // Append the normalisation constant h8 = 1.
     return [...h, 1.0];
   }
 
-  /// Applies homography H to a destination point (dx, dy) and returns the
-  /// corresponding source point.
-  Offset _applyHomography(List<double> h, double dx, double dy) {
+  /// Applies homography H to a destination point (dx, dy) and returns the source point.
+  static Offset _applyHomography(List<double> h, double dx, double dy) {
     final w = h[6] * dx + h[7] * dy + h[8];
     if (w.abs() < 1e-10) return const Offset(0, 0);
     final sx = (h[0] * dx + h[1] * dy + h[2]) / w;
@@ -234,8 +229,7 @@ class ImageCropService {
   }
 
   /// Solves A·x = b via partial-pivot Gaussian elimination.
-  /// Returns the 8-element solution vector.
-  List<double> _gaussianElimination(
+  static List<double> _gaussianElimination(
     List<List<double>> A,
     List<double> b,
   ) {

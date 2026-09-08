@@ -1,6 +1,8 @@
 import 'package:equatable/equatable.dart';
 import 'package:flutter/material.dart';
+import '../../../../core/yolo_vision/models/yolo_model_config.dart';
 import '../../domain/models/scanned_document.dart';
+import 'scanner_state.dart';
 
 abstract class ScannerEvent extends Equatable {
   const ScannerEvent();
@@ -96,7 +98,11 @@ class ApplyFilterEvent extends ScannerEvent {
 }
 
 class RotatePageEvent extends ScannerEvent {
-  const RotatePageEvent();
+  final int? pageIndex;
+  const RotatePageEvent([this.pageIndex]);
+
+  @override
+  List<Object?> get props => [pageIndex];
 }
 
 class DeletePageEvent extends ScannerEvent {
@@ -153,14 +159,68 @@ class ResetScannerEvent extends ScannerEvent {
 
 class LiveCornersDetectedEvent extends ScannerEvent {
   final CropQuadCorners corners;
-  const LiveCornersDetectedEvent(this.corners);
+  final List<CropQuadCorners> cornersList;
+  final bool isDocumentLocked;
+  final double autoCaptureProgress;
+  final double sharpnessScore;
+  final String? statusMessage;
+
+  LiveCornersDetectedEvent({
+    required this.corners,
+    List<CropQuadCorners>? cornersList,
+    this.isDocumentLocked = false,
+    this.autoCaptureProgress = 0.0,
+    this.sharpnessScore = 0.0,
+    this.statusMessage,
+  }) : cornersList = cornersList ?? [corners];
 
   @override
-  List<Object?> get props => [corners];
+  List<Object?> get props => [
+        corners,
+        cornersList,
+        isDocumentLocked,
+        autoCaptureProgress,
+        sharpnessScore,
+        statusMessage,
+      ];
 }
 
 class ClearLiveCornersEvent extends ScannerEvent {
   const ClearLiveCornersEvent();
+}
+
+class SwitchScannerModelEvent extends ScannerEvent {
+  final ScannerModelOption model;
+  const SwitchScannerModelEvent(this.model);
+
+  @override
+  List<Object?> get props => [model];
+}
+
+class UpdateScannerConfigEvent extends ScannerEvent {
+  final double? confThreshold;
+  final double? iouThreshold;
+  final YoloHardwareDelegate? hardwareDelegate;
+  final ScannerModelOption? model;
+
+  const UpdateScannerConfigEvent({
+    this.confThreshold,
+    this.iouThreshold,
+    this.hardwareDelegate,
+    this.model,
+  });
+
+  @override
+  List<Object?> get props => [
+        confThreshold,
+        iouThreshold,
+        hardwareDelegate,
+        model,
+      ];
+}
+
+class ResetScannerConfigEvent extends ScannerEvent {
+  const ResetScannerConfigEvent();
 }
 
 
